@@ -40,6 +40,8 @@ export const PLAYBACK_PREFS_DEFAULTS = {
   crossfadeOverrides:      {},
   setCrossfadeOverride:    () => {},
   removeCrossfadeOverride: () => {},
+  crossfadeOnSkip:         false,
+  crossfadeOnPlay:         false,
   remoteEnabled:           false,
   playbackProgressive:     true,
 };

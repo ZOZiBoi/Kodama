@@ -364,6 +364,7 @@ class IpcAudio {
     this._duration = 0;
     this._buffered = null;    // 0..1 for network streams, null when there is nothing to show
     this._preparing = false;  // play() issued for a new source, nothing decoding yet
+    this._fadePending = false; // crossfadeTo() sent, incoming not started: the sound is the old track's
     this._paused = true;
     this._volume = 0.16;      // same default as Rust thread (0.4² quadratic)
     this._listeners = {};
@@ -383,6 +384,8 @@ class IpcAudio {
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen("audio-progress", ({ payload }) => {
         if (this._fallback) return; // ignore Rust events when in fallback mode
+        // Still the outgoing track's position: the source is already the new one.
+        if (this._fadePending) return;
         this._currentTime = payload.position;
         // When Rust read that position (epoch ms): the report may arrive late, this does not.
         this._positionAt = typeof payload.at === "number" ? payload.at : Date.now();
@@ -395,9 +398,14 @@ class IpcAudio {
       });
       listen("audio-ended", () => {
         if (this._fallback) return;
+        // The outgoing track ran out before the fade could start; Rust reports the fade as
+        // failed once the new track is ready, and it is played outright then.
+        if (this._fadePending) return;
         this._paused = true;
         this._fire("ended");
       });
+      listen("audio-crossfade-started", () => { this._fadePending = false; });
+      listen("audio-crossfade-failed", () => { if (!this._fallback) this._fadeFailed(); });
       listen("audio-loaded", ({ payload }) => {
         if (this._fallback) return;
         if (payload.duration > 0) this._duration = payload.duration;
@@ -447,10 +455,10 @@ class IpcAudio {
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
-  _cmd(name, args) {
+  _cmd(name, args, onError) {
     if (this._fallback) return Promise.resolve(); // Rust path disabled
     console.log("[IpcAudio] →", name, args?.url ? args.url.substring(0, 80) + "…" : "");
-    const go = (invoke) => invoke(name, args || {}).catch(e => console.error("[IpcAudio] ERROR", name, e));
+    const go = (invoke) => invoke(name, args || {}).catch(e => { console.error("[IpcAudio] ERROR", name, e); onError?.(e); });
     if (this._invoke) { go(this._invoke); }
     else { import("@tauri-apps/api/core").then(({ invoke }) => { this._invoke = invoke; go(invoke); }); }
     return Promise.resolve();
@@ -470,6 +478,7 @@ class IpcAudio {
     // Always store locally so we can replay onto fallback if probe hasn't finished
     this._src = url;
     this._srcDirty = true;
+    this._fadePending = false;
     this._pendingSeekTo = 0;
     // Reset position for the new track. The Rust path only updates _currentTime from incoming
     // audio-progress events, so without this it keeps the PREVIOUS track's position until the
@@ -499,7 +508,14 @@ class IpcAudio {
     if (this._fb) { this._fb.currentTime = t; return; }
     this._currentTime = t;
     this._positionAt = Date.now();
-    if (this._srcDirty) {
+    if (this._fadePending) {
+      // A seek into a track whose fade has not started yet: give up the fade and play the
+      // track outright from there. (Seeking now would move the outgoing track instead.)
+      this._fadePending = false;
+      this._srcDirty = true;
+      this._pendingSeekTo = t;
+      if (!this._paused) this.play();
+    } else if (this._srcDirty) {
       this._pendingSeekTo = t;
     } else {
       this._cmd("audio_seek", { position: t });
@@ -540,6 +556,34 @@ class IpcAudio {
       this._cmd("audio_resume");
     }
     return Promise.resolve();
+  }
+
+  // Fade from what is playing into `url` over `duration` seconds: a track change the listener
+  // made, with its crossfade option on. Stands in for `src = url; play()` - the source changes
+  // now, the sound once Rust has the new track ready (it reports "audio-crossfade-started").
+  // If the fade cannot happen the track is played outright (see "audio-crossfade-failed").
+  crossfadeTo(url, duration) {
+    if (this._fb) { this.src = url; return this.play(); }
+    this._src = url;
+    this._srcDirty = false;
+    this._pendingSeekTo = 0;
+    this._currentTime = 0;
+    this._positionAt = Date.now();
+    this._duration = 0;
+    this._buffered = null;
+    this._paused = false;
+    this._fadePending = true;
+    this._cmd("audio_crossfade", { url, seekTo: 0, duration }, () => this._fadeFailed());
+    return Promise.resolve();
+  }
+
+  // No fade after all (nothing left to fade from, the build failed, the command was refused):
+  // play the new track the plain way - a cut, as if the option were off.
+  _fadeFailed() {
+    if (!this._fadePending) return;
+    this._fadePending = false;
+    this._srcDirty = true;
+    if (!this._paused) this.play();
   }
 
   pause() {
@@ -1492,6 +1536,17 @@ function vibrantAccentFromImage(img, satMin = 0.5, light = 0.6) {
 // ready but does not start it. Shared between the two components through the module.
 const startPaused = { next: false };
 
+// Set just before a track change the listener asked for, saying which kind it is: "skip" (next or
+// previous from any control, a song picked in the queue) or "play" (a song started from anywhere
+// else). With the matching option on, the Player fades into that track instead of cutting to it.
+// Anything unmarked - a song ending, autoplay, a room's song - behaves as it always has. Keyed
+// by videoId, so a change that never happened cannot leave its mark on the next one.
+const manualChange = { videoId: null, kind: null };
+const markManualChange = (track, kind) => {
+  manualChange.videoId = track?.videoId ?? null;
+  manualChange.kind = kind;
+};
+
 function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPlaying, onEditScrobble, expanded, onExpandToggle, showLyrics, onToggleLyrics, videoAvailable = false, showVideoView = false, onSetVideoView, videoSync, queueOpen, onToggleQueue, fullscreen, onToggleFullscreen, onOpenAlbum, onOpenArtist, onExportSong, onDownloadSong, cachedSongIds, downloadingIds, onRefetchLyrics, isCustomLyrics = false, onImportLyrics, onRemoveCustomLyrics, onOpenLyricsBrowser, onPremiumDetected, onCreatePlaylist, onAddToPlaylist }) {
   // The lyrics translation toggle + target language live in the ⋮ menu; they are global
   // preferences, so they come from context rather than being threaded through App().
@@ -1501,7 +1556,7 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
   } = useLyricsPrefs();
   // Read-only here: crossfade/crossfadeOverrides are mirrored into refs below, and the
   // timing-critical audio paths read those refs, not these values.
-  const { crossfade, crossfadeOverrides, remoteEnabled, playbackProgressive } = usePlaybackPrefs();
+  const { crossfade, crossfadeOverrides, crossfadeOnSkip, crossfadeOnPlay, remoteEnabled, playbackProgressive } = usePlaybackPrefs();
   const [progress, setProgress] = useState(0);
   // 0..1 while streaming, null when there is nothing to indicate (classic playback / local file).
   const [buffered, setBuffered] = useState(null);
@@ -1623,6 +1678,8 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
   const crossfadePendingTrackRef = useRef(null);  // next track, set until Rust confirms "started"
   const crossfadeFailedTrackRef = useRef(null);   // videoId a crossfade failed for (don't retry it)
   const skipStreamResetRef = useRef(false);       // suppress audio_play after a crossfade advance
+  const manualFadeRef = useRef(false);            // the fade in flight is a manual change's (see manualChange)
+  const audibleIdRef = useRef(null);              // videoId of the track last handed to the audio core
   const videoModeActiveRef = useRef(false);       // audioRef is currently playing the counterpart's own audio, not the song's
   const videoModeTrackIdRef = useRef(null);       // which track's video mode this is — guards against a race with a real track change
   const showVideoViewRef = useRef(showVideoView); showVideoViewRef.current = showVideoView;
@@ -1634,6 +1691,26 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
   useEffect(() => { crossfadeRef.current = crossfade; }, [crossfade]);
   const crossfadeOverridesRef = useRef(crossfadeOverrides);
   useEffect(() => { crossfadeOverridesRef.current = crossfadeOverrides; }, [crossfadeOverrides]);
+  const crossfadeOnSkipRef = useRef(crossfadeOnSkip);
+  useEffect(() => { crossfadeOnSkipRef.current = crossfadeOnSkip; }, [crossfadeOnSkip]);
+  const crossfadeOnPlayRef = useRef(crossfadeOnPlay);
+  useEffect(() => { crossfadeOnPlayRef.current = crossfadeOnPlay; }, [crossfadeOnPlay]);
+
+  // How long to fade into `toId`, or 0 to cut to it as always. Only for a change the listener
+  // made (`kind` from manualChange) with its option on, and only out of a track the Rust core is
+  // audibly playing: paused, still loading or the HTML5 fallback all cut. The length is the one
+  // the natural fade would use for this pair - a custom fade set for it in the queue, otherwise
+  // the default. The audio core clamps it to what is left of the outgoing track.
+  const manualFadeSecs = (kind, a, toId) => {
+    const wanted = kind === "skip" ? crossfadeOnSkipRef.current : kind === "play" ? crossfadeOnPlayRef.current : false;
+    if (!wanted || a._fallback !== false || a.paused || a.isPreparing || startPaused.next) return 0;
+    if (isRoomListener()) return 0;
+    const fromId = audibleIdRef.current;
+    if (!fromId || fromId === toId) return 0;
+    const ov = crossfadeOverridesRef.current[`${fromId}__${toId}`];
+    const secs = ov ? ov.secs : crossfadeRef.current;
+    return secs > 0 ? secs : 0;
+  };
   useEffect(() => { volumeRef.current = volume; }, [volume]);
 
   useEffect(() => {
@@ -1672,7 +1749,7 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
   // advance and the displayed track info lags several songs behind until the effects catch up.
   const goAdjacent = useCallback((dir) => {
     const tk = getAdjacentTrack(dir);
-    if (tk) { trackRef.current = tk; setTrack(tk); }
+    if (tk) { markManualChange(tk, "skip"); trackRef.current = tk; setTrack(tk); }
     return tk;
   }, [getAdjacentTrack, setTrack]);
 
@@ -1888,18 +1965,42 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
     // playing the incoming track on its second sink — skip audio_play, just sync UI.
     const skipSrcReset = skipStreamResetRef.current;
     skipStreamResetRef.current = false;
+    // Read once, for this track only (see manualChange).
+    const manualKind = manualChange.videoId === track?.videoId ? manualChange.kind : null;
+    manualChange.videoId = null;
+    manualChange.kind = null;
+    const fadeSecs = skipSrcReset ? 0 : manualFadeSecs(manualKind, a, track?.videoId);
 
     if (skipSrcReset) {
       // Audio already playing from the Rust crossfade — just sync state.
       // Don't touch a.src — Rust is mid-blend; fall through to (re)attach listeners.
       // Leave crossfadeActiveRef set: it stays true until Rust emits "done".
+      audibleIdRef.current = track?.videoId ?? null;
       setIsPlaying(true);
       if (a.duration) setDuration(a.duration);
+    } else if (fadeSecs > 0) {
+      // A skip or play with its crossfade option on: fade into this track from what is playing,
+      // through the same two-sink engine as the natural fade. The interface (and with it the
+      // lyrics, media controls, Discord and scrobbling) is on the new track already; Rust brings
+      // it in as soon as it has audio, and takes over from a fade still running. A natural fade
+      // still being built is superseded - its "started" must not move the interface again.
+      crossfadePendingTrackRef.current = null;
+      crossfadeFailedTrackRef.current = null;
+      crossfadeActiveRef.current = true;
+      manualFadeRef.current = true;
+      audibleIdRef.current = track?.videoId ?? null;
+      a.volume = volCurve(volume);
+      volumeRef.current = volume;
+      a.crossfadeTo(streamUrl, fadeSecs);
+      setIsPlaying(true);
+      setProgress(0);
     } else {
       // A fresh/manual play cancels any pending crossfade (Rust's Play stops sink2).
       crossfadeActiveRef.current = false;
       crossfadePendingTrackRef.current = null;
       crossfadeFailedTrackRef.current = null;
+      manualFadeRef.current = false;
+      audibleIdRef.current = track?.videoId ?? null;
       a.src = streamUrl;
       a.volume = volCurve(volume);
       volumeRef.current = volume;
@@ -2042,8 +2143,19 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
         // and suppress the duplicate audio_play in the streamUrl effect.
         if (next) { skipStreamResetRef.current = true; setTrack(next); }
       });
-      reg("audio-crossfade-done", () => { crossfadeActiveRef.current = false; });
+      reg("audio-crossfade-done", () => { crossfadeActiveRef.current = false; manualFadeRef.current = false; });
       reg("audio-crossfade-failed", () => {
+        // A manual change's fade: IpcAudio plays the track outright instead. Nothing to
+        // remember - the natural fade out of that track later is still wanted.
+        if (manualFadeRef.current) {
+          manualFadeRef.current = false;
+          crossfadeActiveRef.current = false;
+          return;
+        }
+        // Not about a natural fade still waiting (a late report from a build that a track
+        // change had already superseded): marking the track now playing would rule out its
+        // own fade into the next song.
+        if (!crossfadePendingTrackRef.current) return;
         // Mark this track so we don't immediately retry; outgoing keeps playing and
         // will hand off via the normal `ended` path once it finishes.
         crossfadeFailedTrackRef.current = trackRef.current?.videoId || null;
@@ -2110,7 +2222,7 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
       if (audioRef.current) audioRef.current.volume = volCurve(v);
     } else if (action === "queueJump" && cmd.videoId) {
       const tk = (h.queue || []).find(q => q.videoId === cmd.videoId);
-      if (tk) h.setTrack(tk);
+      if (tk) { markManualChange(tk, "skip"); h.setTrack(tk); }
     }
   };
   const remoteNpRef = useRef({});
@@ -4614,6 +4726,11 @@ export default function App() {
     if (typeof track !== "function" && listenerBlocked(track)) return;
     setCurrentTrack(track);
   }, [listenerBlocked]);
+  // A song picked in the queue is a skip, as far as crossfading goes (see manualChange).
+  const pickFromQueue = useCallback((track) => {
+    markManualChange(track, "skip");
+    setTrackGuarded(track);
+  }, [setTrackGuarded]);
 
   // The latest queue and track, for callbacks that are not re-created on every change.
   const queueLatestRef = useRef(queue);
@@ -4624,6 +4741,7 @@ export default function App() {
   const handlePlay = useCallback((track, trackList) => {
     if (listenerBlocked(track)) return;
     startPaused.next = false;   // a song played on purpose plays, even if one was queued ready
+    markManualChange(track, "play");
     setCurrentTrack(track);
     setForcedLyricsProvider(null);
     setCurrentLyricsSource("");
@@ -5325,6 +5443,10 @@ export default function App() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [autoplay, setAutoplay] = usePersistedState("kiyoshi-autoplay", true);
   const [crossfade, setCrossfade] = usePersistedState("kiyoshi-crossfade", 0);
+  // Fade on a track change the listener makes, not only when a song ends: next/previous and the
+  // queue ("skip"), and a song started from anywhere else ("play"). Off by default.
+  const [crossfadeOnSkip, setCrossfadeOnSkip] = usePersistedState("kodama-crossfade-on-skip", false);
+  const [crossfadeOnPlay, setCrossfadeOnPlay] = usePersistedState("kodama-crossfade-on-play", false);
   // Progressive playback (default): stream the song for a fast start. Off = classic full
   // download first (more stable on weak devices). Both stay in the Rust audio core.
   const [playbackProgressive, setPlaybackProgressive] = useState(
@@ -6014,22 +6136,21 @@ export default function App() {
           if (audioRef.current.paused) { audioRef.current.play(); setIsPlaying(true); }
           else { audioRef.current.pause(); setIsPlaying(false); }
         }
-      } else if (matchShortcut(sc.nextTrack, e)) {
+      } else if (matchShortcut(sc.nextTrack, e) || matchShortcut(sc.prevTrack, e)) {
         e.preventDefault();
+        // One step through the queue, marked as a skip (see manualChange). The latest-track ref
+        // moves on at once, like the Player's goAdjacent, so a burst of key repeats each steps
+        // one further before React has rendered.
+        const forward = matchShortcut(sc.nextTrack, e);
         const q = queueRef.current;
-        setCurrentTrack(t => {
-          if (!t) return t;
-          const idx = q.findIndex(x => x.videoId === t.videoId);
-          return idx < q.length - 1 ? q[idx + 1] : t;
-        });
-      } else if (matchShortcut(sc.prevTrack, e)) {
-        e.preventDefault();
-        const q = queueRef.current;
-        setCurrentTrack(t => {
-          if (!t) return t;
-          const idx = q.findIndex(x => x.videoId === t.videoId);
-          return idx > 0 ? q[idx - 1] : t;
-        });
+        const t = currentTrackLatestRef.current;
+        if (!t) return;
+        const idx = q.findIndex(x => x.videoId === t.videoId);
+        const next = forward ? (idx < q.length - 1 ? q[idx + 1] : t) : (idx > 0 ? q[idx - 1] : t);
+        if (next === t) return;
+        markManualChange(next, "skip");
+        currentTrackLatestRef.current = next;
+        setCurrentTrack(next);
       } else if (matchShortcut(sc.volUp, e)) {
         e.preventDefault();
         if (audioRef.current) { const dv = Math.min(1, Math.sqrt(audioRef.current.volume) + 0.02); audioRef.current.volume = dv * dv; }
@@ -6141,10 +6262,12 @@ export default function App() {
     crossfadeOverrides,
     setCrossfadeOverride,
     removeCrossfadeOverride,
+    crossfadeOnSkip,
+    crossfadeOnPlay,
     remoteEnabled,
     playbackProgressive,
   }), [crossfade, setCrossfade, crossfadeOverrides, setCrossfadeOverride, removeCrossfadeOverride,
-       remoteEnabled, playbackProgressive]);
+       crossfadeOnSkip, crossfadeOnPlay, remoteEnabled, playbackProgressive]);
 
   return (
     // HeroUI's overlays sit on react-aria, which takes the writing direction from the
@@ -6612,7 +6735,7 @@ export default function App() {
             queue={queue}
             setQueue={setQueue}
             currentTrack={currentTrack}
-            setTrack={setTrackGuarded}
+            setTrack={pickFromQueue}
             onClose={() => setQueueOpen(false)}
             likedIds={likedIds}
             onToggleLike={handleToggleLike}
@@ -6703,6 +6826,10 @@ export default function App() {
             onPairDevice={() => setPairModalOpen(true)}
             crossfade={crossfade}
             onCrossfadeChange={setCrossfade}
+            crossfadeOnSkip={crossfadeOnSkip}
+            onCrossfadeOnSkipChange={setCrossfadeOnSkip}
+            crossfadeOnPlay={crossfadeOnPlay}
+            onCrossfadeOnPlayChange={setCrossfadeOnPlay}
             crossfadeOverrides={crossfadeOverrides}
             onRemoveCrossfadeOverride={removeCrossfadeOverride}
             playbackProgressive={playbackProgressive}
