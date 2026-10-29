@@ -11,7 +11,7 @@ All notable changes to Kodama (formerly Kiyoshi Music) are documented here.
 ## [Unreleased]
 
 Changes:
-- Crossfade when skipping: next, previous and a song picked in the queue fade over instead of cutting, with the crossfade length (or a custom one for that pair). Off by default, under Settings → Playback
+- Crossfade when skipping: next, previous and a song picked in the queue fade over instead of cutting, with the crossfade length (or a custom one for that pair). Skipping several songs in a row fades only into the last one. Off by default, under Settings → Playback
 - Crossfade when playing a song: a song started while another is playing fades in instead of cutting. Off by default, next to it
 
 Fixes:

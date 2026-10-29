@@ -365,6 +365,7 @@ class IpcAudio {
     this._buffered = null;    // 0..1 for network streams, null when there is nothing to show
     this._preparing = false;  // play() issued for a new source, nothing decoding yet
     this._fadePending = false; // crossfadeTo() sent, incoming not started: the sound is the old track's
+    this._fadeTimer = null;    // crossfadeTo() still settling: the command has not gone out yet
     this._paused = true;
     this._volume = 0.16;      // same default as Rust thread (0.4² quadratic)
     this._listeners = {};
@@ -479,6 +480,7 @@ class IpcAudio {
     this._src = url;
     this._srcDirty = true;
     this._fadePending = false;
+    this.holdFade();
     this._pendingSeekTo = 0;
     // Reset position for the new track. The Rust path only updates _currentTime from incoming
     // audio-progress events, so without this it keeps the PREVIOUS track's position until the
@@ -512,6 +514,7 @@ class IpcAudio {
       // A seek into a track whose fade has not started yet: give up the fade and play the
       // track outright from there. (Seeking now would move the outgoing track instead.)
       this._fadePending = false;
+      this.holdFade();
       this._srcDirty = true;
       this._pendingSeekTo = t;
       if (!this._paused) this.play();
@@ -562,7 +565,9 @@ class IpcAudio {
   // made, with its crossfade option on. Stands in for `src = url; play()` - the source changes
   // now, the sound once Rust has the new track ready (it reports "audio-crossfade-started").
   // If the fade cannot happen the track is played outright (see "audio-crossfade-failed").
-  crossfadeTo(url, duration) {
+  // With `settleMs` the command waits that long first, and a newer crossfadeTo (or holdFade)
+  // in the meantime replaces it: a burst of skips fades only into the last song.
+  crossfadeTo(url, duration, settleMs = 0) {
     if (this._fb) { this.src = url; return this.play(); }
     this._src = url;
     this._srcDirty = false;
@@ -573,8 +578,20 @@ class IpcAudio {
     this._buffered = null;
     this._paused = false;
     this._fadePending = true;
-    this._cmd("audio_crossfade", { url, seekTo: 0, duration }, () => this._fadeFailed());
+    this.holdFade();
+    const send = () => {
+      this._fadeTimer = null;
+      this._cmd("audio_crossfade", { url, seekTo: 0, duration }, () => this._fadeFailed());
+    };
+    if (settleMs > 0) this._fadeTimer = setTimeout(send, settleMs);
+    else send();
     return Promise.resolve();
+  }
+
+  // Drop a crossfade that is still settling, before it reaches the audio core. The track keeps
+  // playing as it is; whatever replaces the change (a newer skip, a cut) takes it from here.
+  holdFade() {
+    if (this._fadeTimer) { clearTimeout(this._fadeTimer); this._fadeTimer = null; }
   }
 
   // No fade after all (nothing left to fade from, the build failed, the command was refused):
@@ -1546,6 +1563,10 @@ const markManualChange = (track, kind) => {
   manualChange.videoId = track?.videoId ?? null;
   manualChange.kind = kind;
 };
+// A skip's fade waits this long for the listener to stop skipping, and every further skip starts
+// the wait again: pressing Next three times fades into the third song, without running the two
+// in between through the fade. The title changes on every press; only the sound waits.
+const SKIP_SETTLE_MS = 500;
 
 function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPlaying, onEditScrobble, expanded, onExpandToggle, showLyrics, onToggleLyrics, videoAvailable = false, showVideoView = false, onSetVideoView, videoSync, queueOpen, onToggleQueue, fullscreen, onToggleFullscreen, onOpenAlbum, onOpenArtist, onExportSong, onDownloadSong, cachedSongIds, downloadingIds, onRefetchLyrics, isCustomLyrics = false, onImportLyrics, onRemoveCustomLyrics, onOpenLyricsBrowser, onPremiumDetected, onCreatePlaylist, onAddToPlaylist }) {
   // The lyrics translation toggle + target language live in the ⋮ menu; they are global
@@ -1942,6 +1963,8 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
     // suppressed on later songs. (The video toggle itself doesn't re-run this effect: it swaps
     // a.src directly without touching `track`.)
     videoModeActiveRef.current = false;
+    // A skip's fade still settling belongs to the track being left: it must not start now.
+    audioRef.current?.holdFade?.();
     setLoading(true);
     setStreamUrl(null);
     let cancelled = false;
@@ -1991,7 +2014,7 @@ function Player({ track, setTrack, queue, setQueue, audioRef, isPlaying, setIsPl
       audibleIdRef.current = track?.videoId ?? null;
       a.volume = volCurve(volume);
       volumeRef.current = volume;
-      a.crossfadeTo(streamUrl, fadeSecs);
+      a.crossfadeTo(streamUrl, fadeSecs, manualKind === "skip" ? SKIP_SETTLE_MS : 0);
       setIsPlaying(true);
       setProgress(0);
     } else {
