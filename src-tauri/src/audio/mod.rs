@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod crossfade;
 pub mod eq;
 pub mod decoder;
 pub mod http_source;
